@@ -16,6 +16,8 @@ extern crate log;
 #[macro_use]
 extern crate serde_derive;
 extern crate colored;
+extern crate futures;
+extern crate tokio_core;
 extern crate url;
 
 use std::convert::From;
@@ -25,11 +27,14 @@ use std::path::Path;
 use std::str::FromStr;
 
 use chrono::prelude::*;
+use futures::done;
+use futures::Future;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 use reqwest::{header, Client, Response};
 use serde_json;
+use tokio_core::reactor::Core;
 use url::Url;
 
 mod aws;
@@ -380,7 +385,6 @@ impl<'a> Handler<'a> {
         authorize_string.push_str(&signature);
         headers.insert(header::AUTHORIZATION, authorize_string.parse().unwrap());
 
-        // get a client builder
         let client = Client::builder().default_headers(headers).build().unwrap();
 
         let action;
@@ -404,8 +408,21 @@ impl<'a> Handler<'a> {
         }
         match action.body((*payload).clone()).send() {
             Ok(mut res) => Ok(res.handle_response()),
-            Err(_) => Err("Reqwest Error"),
+            Err(e) => {
+                error!("{:}", e);
+                Err("Reqwest Error")
+            }
         }
+    }
+    fn aws_v2_request_future(
+        &self,
+        method: &str,
+        s3_object: &S3Object,
+        qs: &Vec<(&str, &str)>,
+        insert_headers: &Vec<(&str, &str)>,
+        payload: &Vec<u8>,
+    ) -> impl Future<Item = (Vec<u8>, reqwest::header::HeaderMap), Error = &str> {
+        done(self.aws_v2_request(method, s3_object, qs, insert_headers, payload))
     }
 
     // region, endpoint parameters are used for HTTP redirect
@@ -594,7 +611,10 @@ impl<'a> Handler<'a> {
                     false => Ok(res.handle_response()),
                 }
             }
-            Err(_) => Err("Reqwest Error"),
+            Err(e) => {
+                error!("{:}", e);
+                Err("Reqwest Error")
+            }
         }
     }
 
@@ -615,6 +635,16 @@ impl<'a> Handler<'a> {
             self.region.clone(),
             None,
         )
+    }
+    fn aws_v4_request_future(
+        &self,
+        method: &str,
+        s3_object: &S3Object,
+        qs: &Vec<(&str, &str)>,
+        headers: &Vec<(&str, &str)>,
+        payload: Vec<u8>,
+    ) -> impl Future<Item = (std::vec::Vec<u8>, reqwest::header::HeaderMap), Error = &str> {
+        done(self.aws_v4_request(method, s3_object, qs, headers, payload))
     }
     fn next_marker_xml_parser(&self, res: &str) -> Option<String> {
         let mut reader = Reader::from_str(res);
@@ -1102,6 +1132,8 @@ impl<'a> Handler<'a> {
                     Ok(f) => f,
                     Err(_) => return Err("input file open error"),
                 };
+
+                let mut reactor = Core::new().unwrap();
                 loop {
                     part += 1;
 
@@ -1123,98 +1155,128 @@ impl<'a> Handler<'a> {
                         };
                     }
 
-                    // TODO: concurent here
-                    let headers = match self.auth_type {
+                    match self.auth_type {
                         AuthType::AWS4 => {
                             if part == total_part_number {
-                                self.aws_v4_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    tail_buffer,
-                                )?
-                                .1
+                                reactor.run(
+                                    self.aws_v4_request_future(
+                                        "PUT",
+                                        &s3_object,
+                                        &vec![
+                                            ("uploadId", upload_id.as_str()),
+                                            ("partNumber", part.to_string().as_str()),
+                                        ],
+                                        &Vec::new(),
+                                        tail_buffer,
+                                    )
+                                    .and_then(|r| {
+                                        let etag = r.1[reqwest::header::ETAG]
+                                            .to_str()
+                                            .expect("unexpected etag from server");
+                                        etags.push((part.clone(), etag.to_string()));
+                                        info!("part: {} uploaded, etag: {}", part, etag);
+                                        Ok(())
+                                    }),
+                                );
                             } else {
-                                self.aws_v4_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    buffer.to_vec(),
-                                )?
-                                .1
+                                reactor.run(
+                                    self.aws_v4_request_future(
+                                        "PUT",
+                                        &s3_object,
+                                        &vec![
+                                            ("uploadId", upload_id.as_str()),
+                                            ("partNumber", part.to_string().as_str()),
+                                        ],
+                                        &Vec::new(),
+                                        buffer.to_vec(),
+                                    )
+                                    .and_then(|r| {
+                                        let etag = r.1[reqwest::header::ETAG]
+                                            .to_str()
+                                            .expect("unexpected etag from server");
+                                        etags.push((part.clone(), etag.to_string()));
+                                        info!("part: {} uploaded, etag: {}", part, etag);
+                                        Ok(())
+                                    }),
+                                );
                             }
                         }
                         AuthType::AWS2 => {
                             if part == total_part_number {
-                                self.aws_v2_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    &tail_buffer,
-                                )?
-                                .1
+                                reactor.run(
+                                    self.aws_v2_request_future(
+                                        "PUT",
+                                        &s3_object,
+                                        &vec![
+                                            ("uploadId", upload_id.as_str()),
+                                            ("partNumber", part.to_string().as_str()),
+                                        ],
+                                        &Vec::new(),
+                                        &tail_buffer,
+                                    )
+                                    .and_then(|r| {
+                                        let etag = r.1[reqwest::header::ETAG]
+                                            .to_str()
+                                            .expect("unexpected etag from server");
+                                        etags.push((part.clone(), etag.to_string()));
+                                        info!("part: {} uploaded, etag: {}", part, etag);
+                                        Ok(())
+                                    }),
+                                );
                             } else {
-                                self.aws_v2_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    &buffer.to_vec(),
-                                )?
-                                .1
+                                reactor.run(
+                                    self.aws_v2_request_future(
+                                        "PUT",
+                                        &s3_object,
+                                        &vec![
+                                            ("uploadId", upload_id.as_str()),
+                                            ("partNumber", part.to_string().as_str()),
+                                        ],
+                                        &Vec::new(),
+                                        &buffer.to_vec(),
+                                    )
+                                    .and_then(|r| {
+                                        let etag = r.1[reqwest::header::ETAG]
+                                            .to_str()
+                                            .expect("unexpected etag from server");
+                                        etags.push((part.clone(), etag.to_string()));
+                                        info!("part: {} uploaded, etag: {}", part, etag);
+                                        Ok(())
+                                    }),
+                                );
                             }
                         }
                     };
-                    let etag = headers[reqwest::header::ETAG]
-                        .to_str()
-                        .expect("unexpected etag from server");
-                    etags.push((part.clone(), etag.to_string()));
-                    info!("part: {} uploaded, etag: {}", part, etag);
 
                     if part * 5242880 >= file_size {
-                        let mut content = format!("<CompleteMultipartUpload>");
-                        for etag in etags {
-                            content.push_str(&format!(
-                                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
-                                etag.0, etag.1
-                            ));
-                        }
-                        content.push_str(&format!("</CompleteMultipartUpload>"));
-                        let _ = match self.auth_type {
-                            AuthType::AWS4 => self.aws_v4_request(
-                                "POST",
-                                &s3_object,
-                                &vec![("uploadId", upload_id.as_str())],
-                                &Vec::new(),
-                                content.into_bytes(),
-                            ),
-                            AuthType::AWS2 => self.aws_v2_request(
-                                "POST",
-                                &s3_object,
-                                &vec![("uploadId", upload_id.as_str())],
-                                &Vec::new(),
-                                &content.into_bytes(),
-                            ),
-                        };
-                        info!("complete multipart");
                         break;
                     }
                 }
+                let mut content = format!("<CompleteMultipartUpload>");
+                for etag in etags {
+                    content.push_str(&format!(
+                        "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                        etag.0, etag.1
+                    ));
+                }
+                content.push_str(&format!("</CompleteMultipartUpload>"));
+                let _ = match self.auth_type {
+                    AuthType::AWS4 => self.aws_v4_request(
+                        "POST",
+                        &s3_object,
+                        &vec![("uploadId", upload_id.as_str())],
+                        &Vec::new(),
+                        content.into_bytes(),
+                    ),
+                    AuthType::AWS2 => self.aws_v2_request(
+                        "POST",
+                        &s3_object,
+                        &vec![("uploadId", upload_id.as_str())],
+                        &Vec::new(),
+                        &content.into_bytes(),
+                    ),
+                };
+                info!("complete multipart");
             } else {
                 content = Vec::new();
                 let mut fin = match File::open(file) {
