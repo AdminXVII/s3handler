@@ -16,6 +16,7 @@ extern crate log;
 #[macro_use]
 extern crate serde_derive;
 extern crate colored;
+extern crate rayon;
 extern crate url;
 
 use std::convert::From;
@@ -27,6 +28,7 @@ use std::str::FromStr;
 use chrono::prelude::*;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use rayon::prelude::*;
 use regex::Regex;
 use reqwest::{header, Client, Response};
 use serde_json;
@@ -404,8 +406,40 @@ impl<'a> Handler<'a> {
         }
         match action.body((*payload).clone()).send() {
             Ok(mut res) => Ok(res.handle_response()),
-            Err(_) => Err("Reqwest Error"),
+            Err(e) => {
+                error!("{:?}", e);
+                Err("Reqwest Error")
+            }
         }
+    }
+
+    fn aws_v2_multipart_request(
+        &self,
+        s3_object: &S3Object,
+        upload_id: String,
+        part_number: String,
+        payload: &Vec<u8>,
+    ) -> Result<(String, String), &'static str> {
+        let headers = self
+            .aws_v2_request(
+                "PUT",
+                s3_object,
+                &vec![
+                    ("uploadId", upload_id.as_str()),
+                    ("partNumber", part_number.as_str()),
+                ],
+                &Vec::new(),
+                payload,
+            )
+            .expect("mulitpart request error")
+            .1;
+        Ok((
+            part_number.clone(),
+            headers[reqwest::header::ETAG]
+                .to_str()
+                .expect("unexpected etag from server")
+                .to_string(),
+        ))
     }
 
     // region, endpoint parameters are used for HTTP redirect
@@ -594,7 +628,10 @@ impl<'a> Handler<'a> {
                     false => Ok(res.handle_response()),
                 }
             }
-            Err(_) => Err("Reqwest Error"),
+            Err(e) => {
+                error!("{:?}", e);
+                Err("Reqwest Error")
+            }
         }
     }
 
@@ -616,6 +653,38 @@ impl<'a> Handler<'a> {
             None,
         )
     }
+
+    fn aws_v4_multipart_request(
+        &self,
+        s3_object: &S3Object,
+        upload_id: String,
+        part_number: String,
+        payload: Vec<u8>,
+    ) -> Result<(String, String), &'static str> {
+        let headers = self
+            ._aws_v4_request(
+                "PUT",
+                s3_object,
+                &vec![
+                    ("uploadId", upload_id.as_str()),
+                    ("partNumber", part_number.as_str()),
+                ],
+                &Vec::new(),
+                payload,
+                self.region.clone(),
+                None,
+            )
+            .expect("mulitpart request error")
+            .1;
+        Ok((
+            part_number.clone(),
+            headers[reqwest::header::ETAG]
+                .to_str()
+                .expect("unexpected etag from server")
+                .to_string(),
+        ))
+    }
+
     fn next_marker_xml_parser(&self, res: &str) -> Option<String> {
         let mut reader = Reader::from_str(res);
         let mut in_tag = false;
@@ -1096,12 +1165,12 @@ impl<'a> Handler<'a> {
 
                 info!("upload id: {}", upload_id);
 
-                let mut etags = Vec::new();
                 let mut part = 0u64;
                 let mut fin = match File::open(file) {
                     Ok(f) => f,
                     Err(_) => return Err("input file open error"),
                 };
+                let mut jobs = Vec::new();
                 loop {
                     part += 1;
 
@@ -1123,98 +1192,100 @@ impl<'a> Handler<'a> {
                         };
                     }
 
-                    // TODO: concurent here
-                    let headers = match self.auth_type {
-                        AuthType::AWS4 => {
-                            if part == total_part_number {
-                                self.aws_v4_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    tail_buffer,
-                                )?
-                                .1
-                            } else {
-                                self.aws_v4_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    buffer.to_vec(),
-                                )?
-                                .1
-                            }
-                        }
-                        AuthType::AWS2 => {
-                            if part == total_part_number {
-                                self.aws_v2_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    &tail_buffer,
-                                )?
-                                .1
-                            } else {
-                                self.aws_v2_request(
-                                    "PUT",
-                                    &s3_object,
-                                    &vec![
-                                        ("uploadId", upload_id.as_str()),
-                                        ("partNumber", part.to_string().as_str()),
-                                    ],
-                                    &Vec::new(),
-                                    &buffer.to_vec(),
-                                )?
-                                .1
-                            }
-                        }
+                    let payload = if part == total_part_number {
+                        tail_buffer
+                    } else {
+                        buffer.to_vec()
                     };
-                    let etag = headers[reqwest::header::ETAG]
-                        .to_str()
-                        .expect("unexpected etag from server");
-                    etags.push((part.clone(), etag.to_string()));
-                    info!("part: {} uploaded, etag: {}", part, etag);
 
+                    jobs.push((part, payload.clone()));
                     if part * 5242880 >= file_size {
-                        let mut content = format!("<CompleteMultipartUpload>");
-                        for etag in etags {
-                            content.push_str(&format!(
-                                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
-                                etag.0, etag.1
-                            ));
-                        }
-                        content.push_str(&format!("</CompleteMultipartUpload>"));
-                        let _ = match self.auth_type {
-                            AuthType::AWS4 => self.aws_v4_request(
-                                "POST",
-                                &s3_object,
-                                &vec![("uploadId", upload_id.as_str())],
-                                &Vec::new(),
-                                content.into_bytes(),
-                            ),
-                            AuthType::AWS2 => self.aws_v2_request(
-                                "POST",
-                                &s3_object,
-                                &vec![("uploadId", upload_id.as_str())],
-                                &Vec::new(),
-                                &content.into_bytes(),
-                            ),
-                        };
-                        info!("complete multipart");
                         break;
                     }
                 }
+                let mut etag_results = Vec::new();
+                // TODO: solve multipule reqwest client timeout issue
+                //
+                // Note: https://github.com/rayon-rs/rayon/issues/624
+                // ```
+                // rayon is really intended for CPU-parallelism.
+                // If your workload is mostly IO-bound,
+                // you probably want tokio, which has its own thread pool
+                // ```
+                //
+                // Such that
+                // When more than two part uploading,
+                // following error occur.
+                //
+                // ERROR -
+                // Error(Io(Custom { kind: TimedOut, error: "timed out" }),
+                // "http://ant-lab.s3.ap-northeast-1.amazonaws.com/7M?partNumber=3&uploadId=xx")
+                // thread '<unnamed>' panicked at 'mulitpart request error: "Reqwest Error"',
+                // src/libcore/result.rs:1165:5
+                //
+                match self.auth_type {
+                    AuthType::AWS4 => {
+                        let result: Vec<_> = jobs
+                            .par_iter()
+                            .map(|t| {
+                                info!("uploading {} part", t.0);
+                                self.aws_v4_multipart_request(
+                                    &s3_object,
+                                    upload_id.clone(),
+                                    t.0.to_string(),
+                                    t.1.clone(),
+                                )
+                            })
+                            .collect();
+                        for r in result {
+                            etag_results.push(r)
+                        }
+                    }
+                    AuthType::AWS2 => {
+                        let result: Vec<_> = jobs
+                            .par_iter()
+                            .map(|t| {
+                                info!("uploading {} part", t.0);
+                                self.aws_v2_multipart_request(
+                                    &s3_object,
+                                    upload_id.clone(),
+                                    t.0.to_string(),
+                                    &t.1,
+                                )
+                            })
+                            .collect();
+                        for r in result {
+                            etag_results.push(r)
+                        }
+                    }
+                };
+                let mut content = format!("<CompleteMultipartUpload>");
+                for etag_info in etag_results {
+                    let etag = etag_info.unwrap();
+                    info!("part: {} uploaded, etag: {}", etag.0, etag.1);
+                    content.push_str(&format!(
+                        "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                        etag.0, etag.1
+                    ));
+                }
+                content.push_str(&format!("</CompleteMultipartUpload>"));
+                let _ = match self.auth_type {
+                    AuthType::AWS4 => self.aws_v4_request(
+                        "POST",
+                        &s3_object,
+                        &vec![("uploadId", upload_id.as_str())],
+                        &Vec::new(),
+                        content.into_bytes(),
+                    ),
+                    AuthType::AWS2 => self.aws_v2_request(
+                        "POST",
+                        &s3_object,
+                        &vec![("uploadId", upload_id.as_str())],
+                        &Vec::new(),
+                        &content.into_bytes(),
+                    ),
+                };
+                info!("complete multipart");
             } else {
                 content = Vec::new();
                 let mut fin = match File::open(file) {
