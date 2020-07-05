@@ -145,9 +145,9 @@ pub(crate) trait S3Client {
 /// let mut handler = s3handler::Handler::from(&config);
 /// ```
 pub struct Handler<'a> {
-    pub access_key: &'a str,
-    pub secret_key: &'a str,
-    pub host: &'a str,
+    pub access_key: &'a mut str,
+    pub secret_key: &'a mut str,
+    pub host: &'a mut str,
 
     s3_client: Box<dyn S3Client + 'a>,
     pub auth_type: AuthType,
@@ -1306,9 +1306,9 @@ impl<'a> From<&'a CredentialConfig> for Handler<'a> {
             .as_str()
         {
             "aws" => Handler {
-                access_key: &credential.access_key,
-                secret_key: &credential.secret_key,
-                host: &credential.host,
+                access_key: &mut credential.access_key,
+                secret_key: &mut credential.secret_key,
+                host: &mut credential.host,
 
                 s3_client: Box::new(AWS4Client {
                     tls: credential.secure.unwrap_or(false),
@@ -1325,9 +1325,9 @@ impl<'a> From<&'a CredentialConfig> for Handler<'a> {
                 domain_name: credential.host.to_string(),
             },
             "ceph" => Handler {
-                access_key: &credential.access_key,
-                secret_key: &credential.secret_key,
-                host: &credential.host,
+                access_key: &mut credential.access_key,
+                secret_key: &mut credential.secret_key,
+                host: &mut credential.host,
 
                 s3_client: Box::new(AWS4Client {
                     tls: credential.secure.unwrap_or(false),
@@ -1344,9 +1344,9 @@ impl<'a> From<&'a CredentialConfig> for Handler<'a> {
                 domain_name: credential.host.to_string(),
             },
             _ => Handler {
-                access_key: &credential.access_key,
-                secret_key: &credential.secret_key,
-                host: &credential.host,
+                access_key: &mut credential.access_key,
+                secret_key: &mut credential.secret_key,
+                host: &mut credential.host,
                 auth_type: AuthType::AWS4,
                 format: Format::XML,
                 url_style: UrlStyle::PATH,
